@@ -1,166 +1,205 @@
 name: Build RINGER GO BRRR
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Triggers
-# ─────────────────────────────────────────────────────────────────────────────
 on:
   push:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
-  workflow_dispatch:       # allows manual trigger from the Actions tab
+  workflow_dispatch:
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Jobs
-# ─────────────────────────────────────────────────────────────────────────────
 jobs:
   build:
-    name: Build iOS App (unsigned .app)
-    runs-on: macos-14          # Apple Silicon runner; ships Xcode 15+
+    name: Build iOS App (unsigned .ipa)
+    runs-on: macos-14
 
     steps:
 
-      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      # ── 1. Checkout ────────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Select Xcode ──────────────────────────────────────────────────────
-      # macos-14 ships multiple Xcode versions.  We pick the newest stable one.
-      # Adjust the version string if Apple ships a newer one by the time you run this.
+      # ── 2. Select Xcode ───────────────────────────────────────────────────
       - name: Select Xcode version
         run: |
-          # List available Xcode installations for debugging
-          ls /Applications/ | grep Xcode || true
-          sudo xcode-select -s /Applications/Xcode_16.2.app/Contents/Developer || \
-          sudo xcode-select -s /Applications/Xcode_16.1.app/Contents/Developer || \
-          sudo xcode-select -s /Applications/Xcode_16.0.app/Contents/Developer || \
-          sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)/Contents/Developer"
-          xcodebuild -version
+          echo "Available Xcode installs:"
+          ls /Applications/ | grep -i xcode || true
 
-      # ── 3. Generate app icon ─────────────────────────────────────────────────
-      - name: Set up Python for icon generation
+          # Try versions in descending preference order
+          for ver in 16.2 16.1 16.0 15.4 15.3 15.2 15.1 15.0; do
+            if [ -d "/Applications/Xcode_${ver}.app" ]; then
+              sudo xcode-select -s "/Applications/Xcode_${ver}.app/Contents/Developer"
+              echo "Selected Xcode ${ver}"
+              break
+            fi
+          done
+
+          xcodebuild -version
+          swift --version
+
+      # ── 3. Generate app icon ──────────────────────────────────────────────
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
       - name: Install Pillow
-        run: pip install Pillow
+        run: pip install --quiet Pillow
 
       - name: Generate app icon
         run: python scripts/generate_icon.py
 
-      - name: Verify icon was created
+      - name: Verify icon PNG exists
         run: |
-          ls -la "RingerGoBRRR/Assets.xcassets/AppIcon.appiconset/"
-          file "RingerGoBRRR/Assets.xcassets/AppIcon.appiconset/AppIcon-1024.png"
+          ICON="RingerGoBRRR/Assets.xcassets/AppIcon.appiconset/AppIcon-1024.png"
+          if [ ! -f "$ICON" ]; then
+            echo "ERROR: App icon was not generated."
+            exit 1
+          fi
+          ls -lh "$ICON"
+          file "$ICON"
 
-      # ── 4. Build (no signing) ────────────────────────────────────────────────
-      # We build for the generic iOS simulator SDK first as a compile check,
-      # then build for the real device SDK with code signing disabled.
-      # The result is an unsigned .app bundle suitable for Sideloadly.
-
+      # ── 4. Build ──────────────────────────────────────────────────────────
+      # -derivedDataPath pins output to a known location.
+      # CODE_SIGNING_ALLOWED=NO produces an unsigned .app.
+      # SKIP_INSTALL=NO + BUILD_LIBRARY_FOR_DISTRIBUTION=NO keeps the full app bundle.
       - name: Build for iOS device (unsigned)
         run: |
+          set -euo pipefail
+
+          DERIVED_DATA="$RUNNER_TEMP/DerivedData"
+
           xcodebuild \
             -project RingerGoBRRR.xcodeproj \
             -scheme RingerGoBRRR \
             -configuration Release \
             -sdk iphoneos \
             -destination "generic/platform=iOS" \
+            -derivedDataPath "$DERIVED_DATA" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             PROVISIONING_PROFILE_SPECIFIER="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
             DEVELOPMENT_TEAM="" \
             COMPILER_INDEX_STORE_ENABLE=NO \
             build \
-            | xcpretty --color || true
-          # Fall back to raw output if xcpretty not available
-          xcodebuild \
-            -project RingerGoBRRR.xcodeproj \
-            -scheme RingerGoBRRR \
-            -configuration Release \
-            -sdk iphoneos \
-            -destination "generic/platform=iOS" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            PROVISIONING_PROFILE_SPECIFIER="" \
-            DEVELOPMENT_TEAM="" \
-            COMPILER_INDEX_STORE_ENABLE=NO \
-            build 2>&1 | tail -20
+            2>&1 | tee "$RUNNER_TEMP/xcodebuild.log"
 
-      # ── 5. Locate the built .app ─────────────────────────────────────────────
-      - name: Find built .app bundle
-        id: find_app
+          echo "xcodebuild exit code: $?"
+
+      # ── 5. Locate .app at the deterministic path ──────────────────────────
+      - name: Locate .app bundle
+        id: locate_app
         run: |
-          APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData \
-            -name "RingerGoBRRR.app" -type d \
-            -path "*/Release-iphoneos/*" \
-            2>/dev/null | head -1)
+          set -euo pipefail
 
-          if [ -z "$APP_PATH" ]; then
-            # Fallback: search build folder in workspace
-            APP_PATH=$(find . -name "RingerGoBRRR.app" -type d 2>/dev/null | head -1)
+          DERIVED_DATA="$RUNNER_TEMP/DerivedData"
+          APP_DIR="$DERIVED_DATA/Build/Products/Release-iphoneos"
+
+          echo "Contents of Release-iphoneos:"
+          ls -la "$APP_DIR" || { echo "ERROR: Release-iphoneos directory not found."; exit 1; }
+
+          APP_PATH="$APP_DIR/RingerGoBRRR.app"
+
+          if [ ! -d "$APP_PATH" ]; then
+            echo "ERROR: RingerGoBRRR.app not found at expected path: $APP_PATH"
+            echo "Searching entire DerivedData tree for any .app:"
+            find "$DERIVED_DATA" -name "*.app" -type d 2>/dev/null || true
+            echo "--- last 50 lines of xcodebuild log ---"
+            tail -50 "$RUNNER_TEMP/xcodebuild.log" || true
+            exit 1
           fi
 
-          echo "APP_PATH=$APP_PATH" >> $GITHUB_OUTPUT
-          echo "Found app at: $APP_PATH"
-          ls -la "$APP_PATH" || echo "Warning: could not list app contents"
+          echo "Found .app at: $APP_PATH"
+          ls -la "$APP_PATH"
 
-      # ── 6. Package .app into a zip for Sideloadly ────────────────────────────
-      # Sideloadly accepts either a .ipa or a zipped .app.
-      # A .ipa is just a zip with the .app inside a Payload/ folder.
-      - name: Package as .ipa (Payload zip)
+          # Verify it contains a real binary, not just an empty shell
+          BINARY="$APP_PATH/RingerGoBRRR"
+          if [ ! -f "$BINARY" ]; then
+            echo "ERROR: App binary missing inside .app bundle."
+            ls -la "$APP_PATH"
+            exit 1
+          fi
+
+          BINARY_SIZE=$(wc -c < "$BINARY")
+          echo "Binary size: $BINARY_SIZE bytes"
+          if [ "$BINARY_SIZE" -lt 10000 ]; then
+            echo "ERROR: Binary is suspiciously small ($BINARY_SIZE bytes). Build likely failed silently."
+            exit 1
+          fi
+
+          echo "APP_PATH=$APP_PATH" >> "$GITHUB_OUTPUT"
+
+      # ── 6. Package into .ipa ──────────────────────────────────────────────
+      # An .ipa is exactly: zip of a Payload/ directory containing the .app.
+      - name: Package .ipa
+        id: package_ipa
         run: |
-          APP_PATH="${{ steps.find_app.outputs.APP_PATH }}"
+          set -euo pipefail
 
-          mkdir -p "$RUNNER_TEMP/ipa_staging/Payload"
-          cp -r "$APP_PATH" "$RUNNER_TEMP/ipa_staging/Payload/RingerGoBRRR.app"
+          APP_PATH="${{ steps.locate_app.outputs.APP_PATH }}"
+          STAGING="$RUNNER_TEMP/ipa_staging"
+          IPA_PATH="$RUNNER_TEMP/RingerGoBRRR-unsigned.ipa"
 
-          cd "$RUNNER_TEMP/ipa_staging"
-          zip -r "$RUNNER_TEMP/RingerGoBRRR-unsigned.ipa" Payload/
+          rm -rf "$STAGING"
+          mkdir -p "$STAGING/Payload"
+          cp -r "$APP_PATH" "$STAGING/Payload/RingerGoBRRR.app"
 
-          echo "IPA created:"
-          ls -lh "$RUNNER_TEMP/RingerGoBRRR-unsigned.ipa"
+          cd "$STAGING"
+          zip -r "$IPA_PATH" Payload/ -x "*.DS_Store"
 
-      # ── 7. Upload artifact ───────────────────────────────────────────────────
+          IPA_SIZE=$(wc -c < "$IPA_PATH")
+          echo "IPA size: $IPA_SIZE bytes"
+
+          if [ "$IPA_SIZE" -lt 50000 ]; then
+            echo "ERROR: IPA is too small ($IPA_SIZE bytes). Something went wrong with packaging."
+            exit 1
+          fi
+
+          ls -lh "$IPA_PATH"
+          echo "IPA_PATH=$IPA_PATH" >> "$GITHUB_OUTPUT"
+
+      # ── 7. Upload .ipa artifact ───────────────────────────────────────────
       - name: Upload unsigned IPA
         uses: actions/upload-artifact@v4
         with:
           name: RingerGoBRRR-unsigned-ipa
-          path: ${{ runner.temp }}/RingerGoBRRR-unsigned.ipa
+          path: ${{ steps.package_ipa.outputs.IPA_PATH }}
+          if-no-files-found: error    # fails the job if the file is missing
           retention-days: 30
 
-      # ── 8. Also upload the raw .app bundle as a separate artifact ────────────
-      - name: Upload raw .app bundle
+      # ── 8. Upload xcodebuild log (always, for debugging) ──────────────────
+      - name: Upload xcodebuild log
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: RingerGoBRRR-app-bundle
-          path: ${{ steps.find_app.outputs.APP_PATH }}
-          retention-days: 30
+          name: xcodebuild-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: warn
+          retention-days: 7
 
-      # ── 9. Print build summary ───────────────────────────────────────────────
+      # ── 9. Summary ────────────────────────────────────────────────────────
       - name: Build summary
         run: |
+          IPA="${{ steps.package_ipa.outputs.IPA_PATH }}"
+          IPA_SIZE=$(wc -c < "$IPA")
+          IPA_SIZE_KB=$(( IPA_SIZE / 1024 ))
+
           echo "============================================"
-          echo "  RINGER GO BRRR — Build Complete"
+          echo "  RINGER GO BRRR — Build Successful"
           echo "============================================"
-          echo ""
-          echo "  Artifact: RingerGoBRRR-unsigned-ipa"
-          echo "  File:     RingerGoBRRR-unsigned.ipa"
+          echo "  IPA: RingerGoBRRR-unsigned.ipa"
+          echo "  Size: ${IPA_SIZE_KB} KB"
           echo ""
           echo "  To install on your iPhone 15:"
-          echo "  1. Download RingerGoBRRR-unsigned.ipa"
-          echo "     from the Actions artifacts panel."
-          echo "  2. Open Sideloadly on Windows."
-          echo "  3. Connect iPhone via USB."
-          echo "  4. Drag the .ipa into Sideloadly."
-          echo "  5. Enter your Apple ID (free account works)."
-          echo "  6. Sideloadly signs the app and installs it."
-          echo "  7. On iPhone: Settings > General >"
-          echo "     VPN & Device Management > Trust your Apple ID."
+          echo "  1. Download artifact: RingerGoBRRR-unsigned-ipa"
+          echo "  2. Open Sideloadly on Windows"
+          echo "  3. Connect iPhone via USB"
+          echo "  4. Drag the .ipa into Sideloadly"
+          echo "  5. Enter your Apple ID (free account works)"
+          echo "  6. Sideloadly signs and installs the app"
+          echo "  7. iPhone: Settings > General >"
+          echo "     VPN & Device Management > Trust your Apple ID"
           echo ""
-          echo "  NOTE: Free Apple ID provisioning expires in 7 days."
-          echo "  A paid developer account gives 1-year validity."
+          echo "  NOTE: Free Apple ID profiles expire in 7 days."
           echo "============================================"
